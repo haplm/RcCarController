@@ -4,33 +4,35 @@
 #include <rtos.h>
 #include <PinNames.h>
 #include <mbed_wait_api.h>
+#include <mbed_events.h>
 
 //mbed::PwmOut d2(P1_11);
 mbed::Timer steeringPulseTimer;
-mbed::Timer steeringCycleTimer;
 mbed::InterruptIn steeringIn(P1_11);
 rtos::Semaphore in_steering_sem(1);
+events::EventQueue queue(32 * EVENTS_EVENT_SIZE);
+rtos::Thread pwmInCallbackThread;
+
 
 int32_t in_steering_pulse_start;
 int32_t in_steering_pulse_end;
 int32_t in_steering_pulse_width;
-int32_t in_steering_cycle_start;
-int32_t in_steering_cycle_end;
-int32_t in_steering_cycle_width;
-int   in_steering_freq;
+int32_t in_steering_update_ok;
+int32_t in_steering_update_failed;
 
-void steering_rise(void);
-void steering_fall(void);
+void steering_rise_isr(void);
+void steering_fall_isr(void);
+void steering_fall_uc(int width);
 
 void setup() {
   Serial.begin(9600);
   steeringPulseTimer.reset();
-  steeringCycleTimer.reset();
-  in_steering_freq = 0;
   // Setup pin D2 (P1_11) to receive steering input
-  steeringIn.rise(mbed::callback(steering_rise));
-  steeringIn.fall(mbed::callback(steering_fall));
-  // Setup pin D3 (P1_12) to receive throttle input
+  steeringIn.rise(mbed::callback(steering_rise_isr));
+  steeringIn.fall(mbed::callback(steering_fall_isr));
+  in_steering_update_ok = 0;
+  in_steering_update_failed = 0;
+  pwmInCallbackThread.start(mbed::callback(&queue,&events::EventQueue::dispatch_forever));
 }
 
 /* void setup_pwm_out_test() {
@@ -53,49 +55,33 @@ void setup() {
   }
 } */
 
-/**
- *  Interrupt pin rising edge interrupt handler. Reset and start steeringPulseTimer
- */
-void steering_rise(void) {
-  steeringCycleTimer.stop();
-  bool acq = in_steering_sem.try_acquire();
-  if (acq) {
-    in_steering_cycle_width = steeringCycleTimer.read_us();
-    in_steering_sem.release();
-  }
+
+void steering_rise_isr(void) {
   steeringPulseTimer.reset();
-  steeringCycleTimer.reset();
   steeringPulseTimer.start();
-  steeringCycleTimer.start();
-  //in_steering_pulse_start = steeringPulseTimer.read_us();
 }
 
-/**
- *  Interrupt pin falling edge interrupt handler. Read and disengage steeringPulseTimer.
- *  Calculate raw echo pulse length
- */
-void steering_fall(void) {
-  //in_steering_pulse_end = steeringPulseTimer.read_us();
+
+void steering_fall_isr(void) {
   steeringPulseTimer.stop();
-  bool acq = in_steering_sem.try_acquire();
+  queue.call(steering_fall_uc, steeringPulseTimer.read_us());
+}
+
+void steering_fall_uc(int width) {
+  bool acq = in_steering_sem.try_acquire_for(2);
   if (acq) {
-    in_steering_pulse_width = steeringPulseTimer.read_us();
+    in_steering_pulse_width = width;
     in_steering_sem.release();
-  }
-  //in_steering_pulse_width = in_steering_pulse_end - in_steering_pulse_start;
+    in_steering_update_ok++;
+  } else in_steering_update_failed++;
 }
 
 void loop() {
   Serial.print("Pulse: ");
   in_steering_sem.acquire();
   Serial.print(in_steering_pulse_width);
-  Serial.print("\tCycle: ");
-  Serial.print(in_steering_cycle_width);
-  if (in_steering_cycle_width > 0) {
-    in_steering_freq = (1.0 / (float)in_steering_cycle_width) * 1000.0 * 1000.0;
-  }
+  Serial.print("\tacqFails: ");
+  Serial.println(in_steering_update_failed);
   in_steering_sem.release();
-  Serial.print("\tFreq: ");
-  Serial.println(in_steering_freq);
   wait_us(200000);
 }
